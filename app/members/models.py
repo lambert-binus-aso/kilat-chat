@@ -5,12 +5,14 @@ from django.db import models
 class User(models.Model):
     username = models.CharField(max_length=30)
     email = models.CharField(max_length=128, unique=True)
+    password = models.CharField(max_length=128)
 
 class AI_Models(models.Model):
     name = models.CharField(max_length=128)
     provider = models.CharField(max_length=128)
-    cost_per_mil_input_toks = models.DecimalField() # consider using DecimalField
-    cost_per_mil_output_toks = models.DecimalField() # consider using DecimalField
+    # A missing provider-specific rate is unknown, not necessarily free.
+    cost_per_mil_input_toks = models.DecimalField(max_digits=18, decimal_places=8, null=True, blank=True)
+    cost_per_mil_output_toks = models.DecimalField(max_digits=18, decimal_places=8, null=True, blank=True)
 
 
 """ TRANSACTION TABLE """
@@ -35,6 +37,21 @@ class Messages(models.Model):
         on_delete=models.PROTECT
     )
     raw_msg = models.TextField()
+    request_id = models.UUIDField(null=True, blank=True, unique=True)
+    status = models.CharField(
+        max_length=12,
+        choices=[('pending', 'Pending'), ('completed', 'Completed'), ('failed', 'Failed')],
+        default='pending',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['conversation'],
+                condition=models.Q(status='pending'),
+                name='one_pending_message_per_conversation',
+            ),
+        ]
 
 class Responses(models.Model):
     message = models.OneToOneField(
@@ -53,5 +70,7 @@ class APIUsage(models.Model):
     output_tokens = models.PositiveIntegerField()
     total_cost = models.DecimalField(
         max_digits=18,
-        decimal_places=10
+        decimal_places=10,
+        null=True,
+        blank=True,
     ) # in USD
