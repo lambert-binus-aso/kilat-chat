@@ -8,6 +8,7 @@ import json
 import logging
 import uuid
 
+from openai import APIStatusError, APITimeoutError, AuthenticationError, RateLimitError
 from django.db import IntegrityError
 from django.db.models import Max
 from django.db.models.functions import Coalesce
@@ -16,10 +17,11 @@ from django.views.decorators.http import require_GET, require_POST
 
 from .models import AI_Models, Conversations, Messages, Responses, User
 from .services import (
-    NVIDIA_MODELS,
+    SUPPORTED_MODELS,
     configured_models,
     generate_messages,
     has_provider_key,
+    provider_for_model,
     save_answer_and_usage,
     save_prompt_and_build_history,
 )
@@ -47,11 +49,12 @@ def _sse(event, data):
 
 @require_GET
 def models_api(request):
-    records = {row.name for row in configured_models()}
+    records = {(row.name, row.provider) for row in configured_models()}
     return JsonResponse({
         'models': [
-            {'id': name, 'name': details['label'], 'provider': 'NVIDIA'}
-            for name, details in NVIDIA_MODELS.items() if name in records
+            {'id': name, 'name': details['label'], 'provider': provider_for_model(name)}
+            for name, details in SUPPORTED_MODELS.items()
+            if (name, provider_for_model(name)) in records
         ],
     })
 
@@ -132,7 +135,7 @@ def chat_api(request):
         return _error('Enter a message to send.')
     if len(prompt) > MAX_PROMPT_LENGTH:
         return _error('Messages cannot exceed 20,000 characters.')
-    if not isinstance(model_id, str) or model_id not in NVIDIA_MODELS:
+    if not isinstance(model_id, str) or model_id not in SUPPORTED_MODELS:
         return _error('Select a supported model.')
     if conversation_id is not None:
         if isinstance(conversation_id, bool) or not str(conversation_id).isdigit():
@@ -171,9 +174,11 @@ def chat_api(request):
             conversation_id=previous.conversation_id,
         )
 
-    if not has_provider_key():
-        return _error('NVIDIA_API_KEY is not configured on the server.', status=503)
-    model = AI_Models.objects.filter(provider='NVIDIA', name=model_id).first()
+    provider = provider_for_model(model_id)
+    if not has_provider_key(model_id):
+        key_var = 'OPENROUTER_API_KEY' if provider == 'OpenRouter' else 'NVIDIA_API_KEY'
+        return _error(f'{key_var} is not configured on the server. Add it to .env and restart Django.', status=503)
+    model = AI_Models.objects.filter(provider=provider, name=model_id).first()
     if model is None:
         return _error('Model configuration is missing. Run Django migrations.', status=503)
     try:
@@ -211,6 +216,30 @@ def chat_api(request):
             answer = ''.join(answer_parts)
             save_answer_and_usage(saved, answer, usage)
             yield _sse('done', {'conversation_id': conversation.pk, 'title': conversation.title})
+        except RateLimitError:
+            logger.warning('Provider rate limit (model=%s, message_id=%s)', model_id, saved.pk)
+            yield _sse('error', {
+                'error': f'{provider} rate limit reached. Free models have request limits; try again later or choose another model.',
+                'conversation_id': conversation.pk,
+            })
+        except AuthenticationError:
+            logger.warning('Provider authentication failed (provider=%s)', provider)
+            yield _sse('error', {
+                'error': f'{provider} rejected the API key. Check the matching key in .env and restart Django.',
+                'conversation_id': conversation.pk,
+            })
+        except APITimeoutError:
+            logger.warning('Provider timed out (model=%s, message_id=%s)', model_id, saved.pk)
+            yield _sse('error', {
+                'error': f'{provider} timed out. The model may be busy. This prompt was saved but its response did not complete.',
+                'conversation_id': conversation.pk,
+            })
+        except APIStatusError as exc:
+            logger.warning('Provider returned HTTP %s (model=%s)', exc.status_code, model_id)
+            yield _sse('error', {
+                'error': f'{provider} returned HTTP {exc.status_code}. Check model availability and your provider account.',
+                'conversation_id': conversation.pk,
+            })
         except Exception:
             logger.exception('Model generation or answer persistence failed (message_id=%s)', saved.pk)
             yield _sse('error', {

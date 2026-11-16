@@ -9,10 +9,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 const CHAT_URL = '/chat/';
-const DEFAULT_MODEL = 'deepseek-ai/deepseek-v4.1-flash';
+const DEFAULT_MODEL = 'inclusionai/ling-3.2-flash:free';
 const fallbackModels = [
-  { id: DEFAULT_MODEL, name: 'DeepSeek V4.1 Flash', provider: 'NVIDIA' },
-  { id: 'z-ai/glm-5.3-flash', name: 'GLM-5.3 Flash', provider: 'NVIDIA' },
+  { id: DEFAULT_MODEL, name: 'Ling 3.2 Flash (Free)', provider: 'OpenRouter' },
+  { id: 'google/gemma-4-26b-a4b-it:free', name: 'Gemma 4 26B A4B (Free)', provider: 'OpenRouter' },
 ];
 const starters = [
   { icon: Lightbulb, title: 'Think something through', description: 'Explore an idea from every angle', prompt: 'Help me think through a new idea.' },
@@ -34,7 +34,7 @@ function ModelSelect({ model, setModel, disabled, availableModels }) {
     <button type="button" disabled={disabled || availableModels.length===0} className="model-trigger" onClick={() => setOpen(!open)} aria-expanded={open}><span className="model-glyph"><Sparkles size={15}/></span>{availableModels.find(m=>m.id===model)?.name || model}<ChevronDown size={15}/></button>
     {open && <div className="model-dropdown"><div className="dropdown-label">CHOOSE A MODEL</div>{availableModels.map(m =>
       <button key={m.id} type="button" className={'model-option '+(model===m.id?'selected':'')} onClick={() => { setModel(m.id); setOpen(false); }}>
-        <span className="model-color" style={{background:m.id.startsWith('z-ai')?'#a778ed':'#6547d2'}}/><span><strong>{m.name}</strong><small>{m.provider}</small></span>{model===m.id&&<Check size={15}/>}
+        <span className="model-color" style={{background:m.id.startsWith('google/')?'#a778ed':'#6547d2'}}/><span><strong>{m.name}</strong><small>{m.provider}</small></span>{model===m.id&&<Check size={15}/>}
       </button>)}</div>}
   </div>;
 }

@@ -22,16 +22,39 @@ NVIDIA_MODELS = {
 }
 DEFAULT_NVIDIA_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 
+OPENROUTER_MODELS = {
+    "inclusionai/ling-3.2-flash:free": {
+        "label": "Ling 3.2 Flash (Free)",
+    },
+    "google/gemma-4-26b-a4b-it:free": {
+        "label": "Gemma 4 26B A4B (Free)",
+    },
+}
+SUPPORTED_MODELS = {**OPENROUTER_MODELS, **NVIDIA_MODELS}
+DEFAULT_MODEL = "inclusionai/ling-3.2-flash:free"
+
+
+def provider_for_model(model):
+    if model in OPENROUTER_MODELS:
+        return "OpenRouter"
+    if model in NVIDIA_MODELS:
+        return "NVIDIA"
+    raise ValueError("Unsupported model.")
+
 
 def configured_models():
     """Only models explicitly supported by this app can be selected."""
-    return list(AI_Models.objects.filter(
-        name__in=NVIDIA_MODELS, provider="NVIDIA"
-    ))
+    return [
+        row for row in AI_Models.objects.filter(name__in=SUPPORTED_MODELS)
+        if row.provider == provider_for_model(row.name)
+    ]
 
 
-def has_provider_key():
-    return bool(os.getenv("NVIDIA_API_KEY", "").strip())
+def has_provider_key(model=None):
+    """Look up the selected provider's secret from the server environment."""
+    model = model or DEFAULT_MODEL
+    key_var = "OPENROUTER_API_KEY" if provider_for_model(model) == "OpenRouter" else "NVIDIA_API_KEY"
+    return bool(os.getenv(key_var, "").strip())
 
 
 @transaction.atomic
@@ -104,29 +127,37 @@ def save_answer_and_usage(message, answer, usage=None):
 
 
 def generate_messages(messages, model=None):
-    """Yield provider chunks; no network request occurs merely by importing us."""
-    if not has_provider_key():
-        raise RuntimeError("NVIDIA_API_KEY is not configured.")
-    if model is None:
-        model = os.getenv("NVIDIA_MODEL_ID", DEFAULT_NVIDIA_MODEL)
-    if model not in NVIDIA_MODELS:
-        raise ValueError("Unsupported model.")
+    """Stream one provider reply using the selected model's server-side key."""
+    model = model or DEFAULT_MODEL
+    provider = provider_for_model(model)
+    key_var = "OPENROUTER_API_KEY" if provider == "OpenRouter" else "NVIDIA_API_KEY"
+    if not has_provider_key(model):
+        raise RuntimeError(f"{key_var} is not configured.")
     client = OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=os.environ["NVIDIA_API_KEY"],
-        timeout=90.0,
+        base_url=(
+            "https://openrouter.ai/api/v1" if provider == "OpenRouter"
+            else "https://integrate.api.nvidia.com/v1"
+        ),
+        api_key=os.environ[key_var],
+        timeout=120.0 if provider == "OpenRouter" else 270.0,
         max_retries=0,  # retries could incur duplicate inference charges
     )
     stream = None
     try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=NVIDIA_MODELS[model]["temperature"],
-            top_p=NVIDIA_MODELS[model]["top_p"],
-            max_tokens=4096 if model.startswith('z-ai/') else 2048,
-            stream=True,
-        )
+        options = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 2048 if provider == "OpenRouter" else (
+                4096 if model.startswith("z-ai/") else 2048
+            ),
+            "stream": True,
+        }
+        if provider == "OpenRouter":
+            options["stream_options"] = {"include_usage": True}
+        else:
+            options["temperature"] = NVIDIA_MODELS[model]["temperature"]
+            options["top_p"] = NVIDIA_MODELS[model]["top_p"]
+        stream = client.chat.completions.create(**options)
         yield from stream
     finally:
         if stream is not None:

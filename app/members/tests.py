@@ -110,7 +110,7 @@ class ChatAPITests(TestCase):
         session['user_id'] = self.user.id
         session.save()
 
-    def post_chat(self, message='What is a transistor?', model='deepseek-ai/deepseek-v4.1-flash',
+    def post_chat(self, message='What is a transistor?', model='inclusionai/ling-3.2-flash:free',
                   conversation_id=None, request_id=None):
         return self.client.post(
             '/api/chat/',
@@ -135,13 +135,21 @@ class ChatAPITests(TestCase):
             )),
         ])
 
-    def test_model_list_contains_both_supported_models(self):
+    def test_model_list_contains_openrouter_free_and_existing_nvidia_models(self):
         response = self.client.get('/api/models/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             {item['id'] for item in response.json()['models']},
-            {'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'},
+            {
+                'inclusionai/ling-3.2-flash:free',
+                'google/gemma-4-26b-a4b-it:free',
+                'deepseek-ai/deepseek-v4.1-flash',
+                'z-ai/glm-5.3-flash',
+            },
         )
+        by_id = {item['id']: item['provider'] for item in response.json()['models']}
+        self.assertEqual(by_id['inclusionai/ling-3.2-flash:free'], 'OpenRouter')
+        self.assertEqual(by_id['google/gemma-4-26b-a4b-it:free'], 'OpenRouter')
 
     def test_streams_and_persists_chat_with_usage(self):
         model = AI_Models.objects.get(name='deepseek-ai/deepseek-v4.1-flash', provider='NVIDIA')
@@ -152,7 +160,7 @@ class ChatAPITests(TestCase):
         with patch('members.api.has_provider_key', return_value=True), patch(
             'members.api.generate_messages', side_effect=lambda history, model: self.chunks(),
         ) as provider:
-            response = self.post_chat(request_id=identifier)
+            response = self.post_chat(request_id=identifier, model=model.name)
             self.assertEqual(response.status_code, 200)
             events = b''.join(response.streaming_content).decode()
             self.assertIn('event: meta', events)
@@ -177,7 +185,7 @@ class ChatAPITests(TestCase):
 
         # A duplicate POST returns stored output without another provider call.
         with patch('members.api.generate_messages') as provider:
-            duplicate = self.post_chat(request_id=identifier)
+            duplicate = self.post_chat(request_id=identifier, model=model.name)
             self.assertEqual(duplicate.status_code, 200)
             self.assertEqual(duplicate.json()['reply'], '## Hello\n**world**')
             provider.assert_not_called()
@@ -187,15 +195,15 @@ class ChatAPITests(TestCase):
         with patch('members.api.has_provider_key', return_value=True), patch(
             'members.api.generate_messages', side_effect=lambda history, model: self.chunks(),
         ) as provider:
-            first = self.post_chat('Explain RAM.')
+            first = self.post_chat('Explain RAM.', model='inclusionai/ling-3.2-flash:free')
             list(first.streaming_content)
             thread_id = Messages.objects.first().conversation_id
             second = self.post_chat(
-                'Explain ROM.', model='z-ai/glm-5.3-flash',
+                'Explain ROM.', model='google/gemma-4-26b-a4b-it:free',
                 conversation_id=thread_id,
             )
             list(second.streaming_content)
-            self.assertEqual(provider.call_args.kwargs['model'], 'z-ai/glm-5.3-flash')
+            self.assertEqual(provider.call_args.kwargs['model'], 'google/gemma-4-26b-a4b-it:free')
             self.assertEqual(provider.call_args.args[0], [
                 {'role': 'user', 'content': 'Explain RAM.'},
                 {'role': 'assistant', 'content': '## Hello\n**world**'},
@@ -203,8 +211,17 @@ class ChatAPITests(TestCase):
             ])
         self.assertEqual(
             list(Messages.objects.order_by('pk').values_list('model__name', flat=True)),
-            ['deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
+            ['inclusionai/ling-3.2-flash:free', 'google/gemma-4-26b-a4b-it:free'],
         )
+        usage = list(APIUsage.objects.values_list('total_cost', flat=True))
+        self.assertEqual(usage, [Decimal('0E-10'), Decimal('0E-10')])
+
+    def test_openrouter_requires_only_its_own_key_and_saves_nothing_if_missing(self):
+        with patch.dict('os.environ', {'OPENROUTER_API_KEY': ''}):
+            response = self.post_chat()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('OPENROUTER_API_KEY', response.json()['error'])
+        self.assertFalse(Messages.objects.exists())
 
     def test_authentication_and_ownership(self):
         self.assertEqual(self.client.get('/api/conversations/').status_code, 200)
@@ -277,3 +294,27 @@ class ChatAPITests(TestCase):
             self.assertTrue(options['stream'])
             streamed.close.assert_called_once()
             client_type.return_value.close.assert_called_once()
+
+    def test_openrouter_models_use_environment_bearer_and_stream(self):
+        for model_id in (
+            'inclusionai/ling-3.2-flash:free',
+            'google/gemma-4-26b-a4b-it:free',
+        ):
+            with self.subTest(model=model_id):
+                streamed = MagicMock()
+                streamed.__iter__.return_value = iter([])
+                with patch.dict('os.environ', {'OPENROUTER_API_KEY': 'test-openrouter-bearer'}), patch(
+                    'members.services.OpenAI',
+                ) as client_type:
+                    client_type.return_value.chat.completions.create.return_value = streamed
+                    list(generate_messages([{'role': 'user', 'content': 'Hello'}], model=model_id))
+                    client_options = client_type.call_args.kwargs
+                    self.assertEqual(client_options['api_key'], 'test-openrouter-bearer')
+                    self.assertEqual(client_options['base_url'], 'https://openrouter.ai/api/v1')
+                    self.assertEqual(client_options['max_retries'], 0)
+                    options = client_type.return_value.chat.completions.create.call_args.kwargs
+                    self.assertEqual(options['model'], model_id)
+                    self.assertTrue(options['stream'])
+                    self.assertEqual(options['stream_options'], {'include_usage': True})
+                    streamed.close.assert_called_once()
+                    client_type.return_value.close.assert_called_once()
